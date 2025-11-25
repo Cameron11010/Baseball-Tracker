@@ -1,0 +1,8 @@
+path: C:/Users/Cameron/UNI/PycharmProjects/3rd Year/Machine Learning Hardware/My Obj tracking/images.cv/data
+
+train: train/images
+val: val/images
+test: test/images
+
+names:
+  0: baseball
