@@ -1,0 +1,1 @@
+The training was done on the folder found here: https://images.cv/download/baseball/1558
