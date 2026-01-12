@@ -6,7 +6,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # Train completely from scratch
+   
     model = YOLO("yolov8n.yaml")
 
     model.train(
