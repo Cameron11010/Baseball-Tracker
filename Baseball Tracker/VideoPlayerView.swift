@@ -32,6 +32,5 @@ struct VideoPlayerView: View {
 }
 
 #Preview {
-    // Replace with a valid URL for preview
     VideoPlayerView(url: URL(fileURLWithPath: "/path/to/video.mp4"))
 }
