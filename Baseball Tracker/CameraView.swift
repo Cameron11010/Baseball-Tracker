@@ -2,9 +2,6 @@
 //  CameraView.swift
 //  Baseball Tracker
 //
-//  Supports live camera + processing of existing video files with YOLO tracking
-//  iOS 26 safe
-//
 
 import SwiftUI
 import AVFoundation
@@ -31,12 +28,130 @@ struct CameraView: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: CameraViewController, context: Context) {}
 }
 
+// MARK: - Parabolic Trajectory Smoother
+class TrajectoryKalmanSmoother {
+    
+    static func smoothTrajectory(_ points: [CGPoint]) -> [CGPoint] {
+        guard points.count >= 3 else { return points }
+        
+        let parabola = fitParabola(to: points)
+        
+        guard let (a, b, c) = parabola else {
+            return points
+        }
+        
+        let xValues = points.map { $0.x }
+        guard let minX = xValues.min(), let maxX = xValues.max() else { return points }
+        
+        let numPoints = max(points.count * 4, 50)
+        var smoothedPoints: [CGPoint] = []
+        
+        for i in 0..<numPoints {
+            let t = Double(i) / Double(numPoints - 1)
+            let x = Double(minX) + t * Double(maxX - minX)
+            let y = a * x * x + b * x + c
+            
+            smoothedPoints.append(CGPoint(x: x, y: y))
+        }
+        
+        return smoothedPoints
+    }
+    
+    // MARK: - Parabola Fitting using Least Squares
+
+    private static func fitParabola(to points: [CGPoint]) -> (a: Double, b: Double, c: Double)? {
+        guard points.count >= 3 else { return nil }
+        
+        let n = Double(points.count)
+        
+        var sumX = 0.0, sumX2 = 0.0, sumX3 = 0.0, sumX4 = 0.0
+        var sumY = 0.0, sumXY = 0.0, sumX2Y = 0.0
+        
+        for point in points {
+            let x = Double(point.x)
+            let y = Double(point.y)
+            let x2 = x * x
+            let x3 = x2 * x
+            let x4 = x2 * x2
+            
+            sumX += x
+            sumX2 += x2
+            sumX3 += x3
+            sumX4 += x4
+            sumY += y
+            sumXY += x * y
+            sumX2Y += x2 * y
+        }
+        
+        
+        let matrix: [[Double]] = [
+            [sumX4, sumX3, sumX2],
+            [sumX3, sumX2, sumX],
+            [sumX2, sumX, n]
+        ]
+        
+        let vector = [sumX2Y, sumXY, sumY]
+        
+        guard let solution = solveLinearSystem(matrix: matrix, vector: vector) else {
+            return nil
+        }
+        
+        return (a: solution[0], b: solution[1], c: solution[2])
+    }
+    
+    // MARK: - Linear System Solver (Gaussian Elimination)
+    
+    private static func solveLinearSystem(matrix: [[Double]], vector: [Double]) -> [Double]? {
+        guard matrix.count == 3, matrix[0].count == 3, vector.count == 3 else { return nil }
+        
+        var aug = matrix.map { $0 }
+        for i in 0..<3 {
+            aug[i].append(vector[i])
+        }
+        
+        for col in 0..<3 {
+            var maxRow = col
+            for row in (col + 1)..<3 {
+                if abs(aug[row][col]) > abs(aug[maxRow][col]) {
+                    maxRow = row
+                }
+            }
+            
+            if maxRow != col {
+                aug.swapAt(col, maxRow)
+            }
+            
+            if abs(aug[col][col]) < 1e-10 {
+                return nil
+            }
+            
+            for row in (col + 1)..<3 {
+                let factor = aug[row][col] / aug[col][col]
+                for j in col..<4 {
+                    aug[row][j] -= factor * aug[col][j]
+                }
+            }
+        }
+        
+        var solution = [Double](repeating: 0.0, count: 3)
+        for i in (0..<3).reversed() {
+            var sum = aug[i][3]
+            for j in (i + 1)..<3 {
+                sum -= aug[i][j] * solution[j]
+            }
+            solution[i] = sum / aug[i][i]
+        }
+        
+        return solution
+    }
+}
+
 class CameraViewController: UIViewController {
     
     // MARK: - Camera
     private let captureSession = AVCaptureSession()
-    // Serial queue for all capture session work to avoid blocking main thread
     private let sessionQueue = DispatchQueue(label: "camera.session.queue")
+    private let visionQueue = DispatchQueue(label: "camera.vision.queue", qos: .userInteractive)
     
     private var videoDeviceInput: AVCaptureDeviceInput!
     private var videoOutput: AVCaptureVideoDataOutput!
@@ -52,7 +167,9 @@ class CameraViewController: UIViewController {
     var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     var recordingStartTime: CMTime?
     
-    // Store the active camera frame rate (fps) and active dimensions; used to configure writer so Photos recognizes the asset as genuine high‑fps (slow‑motion) video
+    private var lastFrameTime: CMTime?
+    private var frameCount: Int = 0
+    
     private var activeFrameRate: Double = 30
     private var activeDimensions: CMVideoDimensions = CMVideoDimensions(width: 1920, height: 1080)
     
@@ -61,11 +178,12 @@ class CameraViewController: UIViewController {
     private var requests = [VNRequest]()
     private var lastObservations: [VNRecognizedObjectObservation] = []
     private let allowedClasses = ["baseball"]
+    private let confidenceThreshold: Float = 0.35
     
     // MARK: - Overlay
     private var overlayLayer = CALayer()
-    private var ballTrailNormalized: [CGPoint] = []
-    private let maxTrailLength = 15
+    
+    private var detectionMarkers: [CGPoint] = []
     
     // MARK: - UI
     private var processingOverlay: UIView?
@@ -89,6 +207,7 @@ class CameraViewController: UIViewController {
     // MARK: - Lifecycle
     override func viewDidLoad() {
         super.viewDidLoad()
+        print("🎥 CameraViewController viewDidLoad started")
         view.backgroundColor = .black
         onRecordingStateChanged?(false)
         
@@ -97,9 +216,13 @@ class CameraViewController: UIViewController {
         setupBackButton()
         setupRecordButton()
         
+        self.detectionMarkers.removeAll()
+        
         if let url = videoURL {
+            print("🎥 Processing video file mode")
             processVideoFile(url)
         } else {
+            print("🎥 Live camera mode - setting up camera...")
             sessionQueue.async { [weak self] in
                 self?.setupCamera()
             }
@@ -113,7 +236,6 @@ class CameraViewController: UIViewController {
         overlayLayer.position = CGPoint(x: view.bounds.midX, y: view.bounds.midY)
         processingOverlay?.frame = view.bounds
         
-        // Layout back button at top-left safe area
         if let backButton = backButton {
             let safeArea = view.safeAreaInsets
             let buttonHeight: CGFloat = 44
@@ -122,7 +244,6 @@ class CameraViewController: UIViewController {
             view.bringSubviewToFront(backButton)
         }
         
-        // Layout record button at bottom center safe area
         if let recordButton = recordButton {
             let safeArea = view.safeAreaInsets
             let buttonSize: CGFloat = 70
@@ -150,7 +271,6 @@ class CameraViewController: UIViewController {
         view.addSubview(button)
         self.backButton = button
         
-        // Constraints for accessibility even if frame is set in layoutSubviews
         NSLayoutConstraint.activate([
             button.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
             button.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
@@ -210,10 +330,8 @@ class CameraViewController: UIViewController {
     private func startCustomRecording() {
         guard !isRecording else { return }
         
-        // Detect device orientation and choose encoding dimensions based on active camera format
         let orientation = UIDevice.current.orientation
         let isPortrait = orientation == .portrait || orientation == .portraitUpsideDown
-        // Use the active capture format dimensions to preserve high-fps format resolution, then orient
         let baseWidth = Int(self.activeDimensions.width)
         let baseHeight = Int(self.activeDimensions.height)
         let videoWidth = isPortrait ? min(baseWidth, baseHeight) : max(baseWidth, baseHeight)
@@ -231,30 +349,23 @@ class CameraViewController: UIViewController {
             return
         }
         
-        // IMPORTANT: Include AVVideoExpectedSourceFrameRateKey with the active camera frame rate
-        // This ensures the output video preserves the high frame rate chosen by the camera (e.g., 120 or 240 fps)
-        // so that slow motion video plays natively in Photos and other players.
+        print("[Recording] Using ProRes for \(videoWidth)x\(videoHeight) @ \(self.activeFrameRate) fps")
+        
         let videoSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoCodecKey: AVVideoCodecType.proRes422Proxy,
             AVVideoWidthKey: videoWidth,
-            AVVideoHeightKey: videoHeight,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoExpectedSourceFrameRateKey: Int(self.activeFrameRate),
-                AVVideoAverageBitRateKey: 20_000_000,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
-            ]
+            AVVideoHeightKey: videoHeight
         ]
         
         assetWriterInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         assetWriterInput?.expectsMediaDataInRealTime = true
         
-        // Preserve timing so the nominalFrameRate remains the high fps in the saved asset
         let mediaTimeScale = CMTimeScale(max(600, Int32(self.activeFrameRate * 10)))
         assetWriter?.movieTimeScale = mediaTimeScale
         assetWriterInput?.mediaTimeScale = mediaTimeScale
         
-        // IMPORTANT: Do NOT apply rotation transform here.
-        // Setting transform to .identity ensures the video is recorded upright.
+        assetWriterInput?.performsMultiPassEncodingIfSupported = false
+        
         assetWriterInput?.transform = videoTransform
         
         guard let assetWriter = assetWriter,
@@ -270,11 +381,11 @@ class CameraViewController: UIViewController {
             return
         }
         
-        // Use width/height accordingly for pixel buffer attributes
         let sourcePixelBufferAttributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
             kCVPixelBufferWidthKey as String: videoWidth,
-            kCVPixelBufferHeightKey as String: videoHeight
+            kCVPixelBufferHeightKey as String: videoHeight,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
         ]
         
         pixelBufferAdaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: assetWriterInput,
@@ -282,9 +393,17 @@ class CameraViewController: UIViewController {
         
         recordingStartTime = nil
         
+        self.detectionMarkers.removeAll()
+        
+        // Reset frame timing debug
+        self.lastFrameTime = nil
+        self.frameCount = 0
+        
         isRecording = true
         updateRecordButton(isRecording: true)
         onRecordingStateChanged?(true)
+        
+        print("[Recording] Started recording at \(self.activeFrameRate) fps using ProRes 422 Proxy")
     }
     
     private func stopCustomRecording() {
@@ -294,13 +413,27 @@ class CameraViewController: UIViewController {
         updateRecordButton(isRecording: false)
         onRecordingStateChanged?(false)
         
+        if let startTime = recordingStartTime, let endTime = lastFrameTime {
+            let duration = CMTimeGetSeconds(CMTimeSubtract(endTime, startTime))
+            let avgFPS = Double(frameCount) / duration
+            print("[Recording] Stopped. Recorded \(frameCount) frames in \(String(format: "%.2f", duration))s = \(String(format: "%.1f", avgFPS)) fps average")
+        }
+        
         assetWriterInput.markAsFinished()
         assetWriter.finishWriting { [weak self] in
             guard let self = self else { return }
-            let outputURL = assetWriter.outputURL
+            let rawVideoURL = assetWriter.outputURL
             
-            // Use new saveToPhotosThenAlert method to save and then dismiss to root and show alert
-            self.saveToPhotosThenAlert(outputURL: outputURL)
+            print("[Recording] Raw video saved to: \(rawVideoURL.path)")
+            print("[Recording] Starting annotation post-processing...")
+            
+            DispatchQueue.main.async {
+                self.showProcessingOverlay(message: "Adding annotations to video...")
+            }
+            
+            Task {
+                await self.postProcessVideoWithAnnotations(rawVideoURL: rawVideoURL)
+            }
             
             self.assetWriter = nil
             self.assetWriterInput = nil
@@ -309,18 +442,14 @@ class CameraViewController: UIViewController {
         }
     }
     
-    /// Dismiss to root, then present an alert from the root controller
     private func dismissToRootAndPresentAlert(_ alert: UIAlertController) {
         DispatchQueue.main.async {
-            // Capture a reference to the root after dismiss
             let presentAlert = {
                 if let root = self.view.window?.rootViewController {
-                    // Find the top-most from root
                     var top = root
                     while let presented = top.presentedViewController { top = presented }
                     top.present(alert, animated: true)
                 } else {
-                    // Fallback to keyWindow root if available
                     self.topMostViewController().present(alert, animated: true)
                 }
             }
@@ -343,14 +472,12 @@ class CameraViewController: UIViewController {
         }
     }
     
-    // Save to Photos, then dismiss to main and show alert there
     private func saveToPhotosThenAlert(outputURL: URL) {
         Task { @MainActor in
             await withCheckedContinuation { continuation in
                 self.ensurePhotoLibraryPermission { granted in
                     Task { @MainActor in
                         guard granted else {
-                            // Dismiss to root then show denied alert
                             let alert = UIAlertController(title: "Photos Access Denied",
                                                           message: "Annotated video exported to a temporary file, but app does not have permission to save to Photos. Please enable Photos access in Settings.",
                                                           preferredStyle: .alert)
@@ -437,29 +564,33 @@ class CameraViewController: UIViewController {
     
     // MARK: - Camera Setup
     private func setupCamera() {
+        print("🎥 setupCamera() called on thread: \(Thread.current)")
         captureSession.beginConfiguration()
 
         captureSession.sessionPreset = .inputPriority
         
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { return }
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+            print("❌ ERROR: Could not get camera device")
+            return
+        }
         
-        // Prefer well-known high-speed resolutions (1080p, then 720p) when multiple formats share the same max fps.
+        print("✅ Got camera device: \(device.localizedName)")
+        
         let preferredDims: [(width: Int32, height: Int32)] = [
-            (1920, 1080), (1080, 1920), // 1080p landscape/portrait
-            (1280, 720), (720, 1280)    // 720p landscape/portrait
+            (1920, 1080), (1080, 1920),
+            (1280, 720), (720, 1280)
         ]
         
         func maxFPS(for format: AVCaptureDevice.Format) -> Double {
             return format.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0
         }
         
-        // Find highest fps across all formats
         let globalMaxFPS = device.formats.map { maxFPS(for: $0) }.max() ?? 0
+        print("[Camera] Found \(device.formats.count) formats, max fps available: \(globalMaxFPS)")
         
-        // Filter formats that can reach the global max fps
         let highestFPSFormats = device.formats.filter { maxFPS(for: $0) == globalMaxFPS }
+        print("[Camera] \(highestFPSFormats.count) formats support \(globalMaxFPS) fps")
         
-        // Among those, prefer preferredDims ordering
         let preferredHighSpeedFormat: AVCaptureDevice.Format? = {
             for dim in preferredDims {
                 if let match = highestFPSFormats.first(where: { fmt in
@@ -472,7 +603,6 @@ class CameraViewController: UIViewController {
             return nil
         }()
         
-        // Choose final format: preferred if available, otherwise the format with the highest fps and largest resolution
         let chosenFormat: AVCaptureDevice.Format? = preferredHighSpeedFormat ?? device.formats.max(by: { f1, f2 in
             let fps1 = maxFPS(for: f1)
             let fps2 = maxFPS(for: f2)
@@ -488,21 +618,22 @@ class CameraViewController: UIViewController {
         
         if let bestFormat = chosenFormat {
             let maxFrameRate = maxFPS(for: bestFormat)
+            let dims = CMVideoFormatDescriptionGetDimensions(bestFormat.formatDescription)
+            print("[Camera] Chose format: \(dims.width)x\(dims.height) supporting max \(maxFrameRate) fps")
+            
             do {
                 try device.lockForConfiguration()
                 device.activeFormat = bestFormat
-                // Remember best format dimensions for encoding
                 let desc = CMVideoFormatDescriptionGetDimensions(bestFormat.formatDescription)
                 self.activeDimensions = desc
-                // Find the frame rate range with maxFrameRate and set min/max frame duration accordingly
                 if let frameRateRange = bestFormat.videoSupportedFrameRateRanges.first(where: { $0.maxFrameRate == maxFrameRate }) {
                     let duration = CMTimeMake(value: 1, timescale: Int32(frameRateRange.maxFrameRate.rounded()))
                     device.activeVideoMinFrameDuration = duration
                     device.activeVideoMaxFrameDuration = duration
+                    print("[Camera] Set frame duration to \(duration.value)/\(duration.timescale)")
                 }
                 device.unlockForConfiguration()
                 
-                // Derive the actual active fps from the frame duration we set, for accuracy
                 let actualDuration = device.activeVideoMaxFrameDuration
                 if actualDuration.seconds > 0 {
                     self.activeFrameRate = 1.0 / actualDuration.seconds
@@ -510,16 +641,15 @@ class CameraViewController: UIViewController {
                     self.activeFrameRate = Double(maxFrameRate)
                 }
                 
-                // Debug: print selected mode
-                let dims = self.activeDimensions
-                print("[Camera] Selected format: \(dims.width)x\(dims.height) @ ~\(self.activeFrameRate) fps (max \(maxFrameRate))")
+                print("[Camera] Active configuration: \(self.activeDimensions.width)x\(self.activeDimensions.height) @ \(self.activeFrameRate) fps")
             } catch {
                 print("Failed to configure device for highest frame rate: \(error)")
             }
+        } else {
+            print("[Camera] ERROR: No suitable format found!")
         }
         
         do {
-            // Use .inputPriority so our chosen activeFormat + frame durations are honored over presets
             videoDeviceInput = try AVCaptureDeviceInput(device: device)
         } catch {
             print("Error creating device input: \(error)")
@@ -530,17 +660,22 @@ class CameraViewController: UIViewController {
         captureSession.addInput(videoDeviceInput)
         
         videoOutput = AVCaptureVideoDataOutput()
-        videoOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)]
-        videoOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "videoQueue"))
+        videoOutput.videoSettings = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+        ]
+        
+        let videoQueue = DispatchQueue(label: "videoQueue", qos: .userInteractive, attributes: [], autoreleaseFrequency: .workItem)
+        videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
+        
         if captureSession.canAddOutput(videoOutput) {
             captureSession.addOutput(videoOutput)
         }
+        
         videoOutput.alwaysDiscardsLateVideoFrames = false
         
         if let connection = videoOutput.connection(with: .video) {
             if #available(iOS 17.0, *) {
-                // Prefer modern rotation API
-                let desiredAngle: CGFloat = 90 // portrait
+                let desiredAngle: CGFloat = 90
                 if connection.isVideoRotationAngleSupported(desiredAngle) {
                     connection.videoRotationAngle = desiredAngle
                 }
@@ -550,14 +685,12 @@ class CameraViewController: UIViewController {
                 }
             }
             
-            // Live capture preview is using UIKit layer coordinates (top-left origin), so overlays should not flip Y.
             self.mirrored = (videoDeviceInput.device.position == .front)
             self.contentFlippedVertically = false
         }
         
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            // Ensure we are on main thread for any UIView/Layer access
             let bounds = self.view.bounds
             let preview = AVCaptureVideoPreviewLayer(session: self.captureSession)
             preview.videoGravity = .resizeAspectFill
@@ -589,25 +722,21 @@ class CameraViewController: UIViewController {
             let results = (request.results as? [VNRecognizedObjectObservation]) ?? []
             self.lastObservations = results
             
-            self.ballTrailNormalized = results.compactMap { obs in
-                if obs.labels.first?.identifier == "baseball" {
-                    return CGPoint(x: obs.boundingBox.midX, y: obs.boundingBox.midY)
-                }
-                return nil
-            }
+            let baseballDetections = results.filter { obs in
+                guard let label = obs.labels.first else { return false }
+                return label.identifier == "baseball" && obs.confidence >= self.confidenceThreshold
+            }.sorted { $0.confidence > $1.confidence }
             
             DispatchQueue.main.async {
                 self.overlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
-                for obs in results {
-                    if let confidence = obs.labels.first?.confidence,
-                       self.allowedClasses.contains(obs.labels.first?.identifier ?? "") {
-                        self.drawBoundingBox(obs.boundingBox, bufferSize: self.view.bounds.size,
-                                             confidence: confidence, mirrored: self.mirrored,
-                                             contentFlippedVertically: self.contentFlippedVertically)
-                    }
+                
+                if let bestDetection = baseballDetections.first {
+                    self.drawBoundingBox(bestDetection.boundingBox,
+                                         bufferSize: self.view.bounds.size,
+                                         confidence: bestDetection.confidence,
+                                         mirrored: self.mirrored,
+                                         contentFlippedVertically: self.contentFlippedVertically)
                 }
-                self.drawBallTrail(bufferSize: self.view.bounds.size, mirrored: self.mirrored,
-                                   contentFlippedVertically: self.contentFlippedVertically)
             }
         }
         request.imageCropAndScaleOption = .scaleFill
@@ -623,10 +752,8 @@ class CameraViewController: UIViewController {
 
         if mirrored { x = bufferSize.width - x - w }
         if !contentFlippedVertically {
-            
             y = bufferSize.height - y - h
         }
-        
 
         return CGRect(x: x, y: y, width: w, height: h)
     }
@@ -639,7 +766,6 @@ class CameraViewController: UIViewController {
         if !contentFlippedVertically {
             y = bufferSize.height - y
         }
-        
 
         return CGPoint(x: x, y: y)
     }
@@ -649,46 +775,78 @@ class CameraViewController: UIViewController {
                                  contentFlippedVertically: Bool) {
         let boxRect = convertBoundingBox(rect, bufferSize: bufferSize,
                                          mirrored: mirrored, contentFlippedVertically: contentFlippedVertically)
-        let boxLayer = CAShapeLayer()
-        boxLayer.frame = boxRect
-        boxLayer.borderWidth = 2
-        boxLayer.borderColor = UIColor.red.cgColor
+        
+        let centerX = boxRect.midX
+        let centerY = boxRect.midY
+        let radius = max(boxRect.width, boxRect.height) / 2
+        
+        let circleLayer = CAShapeLayer()
+        let circlePath = UIBezierPath(ovalIn: CGRect(x: boxRect.minX, 
+                                                      y: boxRect.minY,
+                                                      width: boxRect.width,
+                                                      height: boxRect.height))
+        circleLayer.path = circlePath.cgPath
+        circleLayer.strokeColor = UIColor.red.cgColor
+        circleLayer.fillColor = UIColor.clear.cgColor
+        circleLayer.lineWidth = 3
         
         let textLayer = CATextLayer()
-        textLayer.string = String(format: "%.2f", confidence)
+        textLayer.string = String(format: "%.0f%%", confidence * 100)
         textLayer.foregroundColor = UIColor.red.cgColor
-        textLayer.fontSize = 14
-        textLayer.frame = CGRect(x: 0, y: -18, width: boxRect.width, height: 18)
+        textLayer.backgroundColor = UIColor.clear.cgColor
+        textLayer.fontSize = 28
+        textLayer.alignmentMode = .center
         textLayer.contentsScale = view.traitCollection.displayScale
-        boxLayer.addSublayer(textLayer)
         
-        overlayLayer.addSublayer(boxLayer)
+        let textWidth: CGFloat = 80
+        let textHeight: CGFloat = 35
+        textLayer.frame = CGRect(x: centerX - textWidth / 2,
+                                y: centerY - textHeight / 2,
+                                width: textWidth,
+                                height: textHeight)
+        
+        overlayLayer.addSublayer(circleLayer)
+        overlayLayer.addSublayer(textLayer)
     }
     
-    private func drawBallTrail(bufferSize: CGSize, mirrored: Bool,
-                               contentFlippedVertically: Bool) {
-        guard !ballTrailNormalized.isEmpty else { return }
-        let trailLayer = CALayer()
-        trailLayer.frame = CGRect(origin: .zero, size: bufferSize)
+    // MARK: - Post-Process Video with Annotations
+    private func postProcessVideoWithAnnotations(rawVideoURL: URL) async {
+        print("[PostProcess] Loading video asset from: \(rawVideoURL.path)")
         
-        for (i, p) in ballTrailNormalized.enumerated() {
-            let point = convertPoint(p, bufferSize: bufferSize, mirrored: mirrored,
-                                     contentFlippedVertically: contentFlippedVertically)
-            let dot = CAShapeLayer()
-            let radius: CGFloat = 5
-            dot.path = UIBezierPath(ovalIn: CGRect(x: point.x - radius, y: point.y - radius,
-                                                   width: radius * 2, height: radius * 2)).cgPath
-            dot.fillColor = UIColor.red.withAlphaComponent(CGFloat(i) / CGFloat(maxTrailLength)).cgColor
-            trailLayer.addSublayer(dot)
+        let asset = AVURLAsset(url: rawVideoURL)
+        
+        do {
+            let tracks = try await asset.loadTracks(withMediaType: .video)
+            guard let track = tracks.first else {
+                print("[PostProcess] ERROR: No video track found")
+                await MainActor.run { self.hideProcessingOverlay() }
+                return
+            }
+            
+            self.detectionMarkers.removeAll()
+            
+            await self.exportAnnotatedVideo(asset: asset, track: track)
+            
+        } catch {
+            print("[PostProcess] Error: \(error)")
+            await MainActor.run {
+                self.hideProcessingOverlay()
+                self.saveToPhotosThenAlert(outputURL: rawVideoURL)
+            }
         }
-        
-        overlayLayer.addSublayer(trailLayer)
     }
-
+    
     // MARK: - Export Annotated Video
     private func exportAnnotatedVideo(asset: AVAsset, track: AVAssetTrack) async {
         do {
+            let trimDuration = CMTime(seconds: 0.5, preferredTimescale: 600)
+            let duration = try await asset.load(.duration)
+            let startTime = trimDuration
+            let endTime = duration
+            let timeRange = CMTimeRange(start: startTime, end: endTime)
+            
             let reader = try AVAssetReader(asset: asset)
+            reader.timeRange = timeRange
             let outputSettings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)]
             let readerOutput = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
             reader.add(readerOutput)
@@ -715,7 +873,6 @@ class CameraViewController: UIViewController {
             let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
             writerInput.expectsMediaDataInRealTime = false
             
-            // Preserve timing so the nominalFrameRate remains the high fps in the saved asset
             let mediaTimeScale = CMTimeScale(max(600, Int32(self.activeFrameRate * 10)))
             writer.movieTimeScale = mediaTimeScale
             writerInput.mediaTimeScale = mediaTimeScale
@@ -737,8 +894,6 @@ class CameraViewController: UIViewController {
             writer.startWriting()
             writer.startSession(atSourceTime: .zero)
 
-            self.ballTrailNormalized.removeAll()
-
             while reader.status == .reading {
                 guard let sampleBuffer = readerOutput.copyNextSampleBuffer(),
                       let px = CMSampleBufferGetImageBuffer(sampleBuffer) else { break }
@@ -748,18 +903,18 @@ class CameraViewController: UIViewController {
                     let handler = VNImageRequestHandler(cvPixelBuffer: px, options: [:])
                     try? handler.perform([req])
                     let results = (req.results as? [VNRecognizedObjectObservation]) ?? []
-
-                    for obs in results {
-                        if obs.labels.first?.identifier == "baseball" {
-                            let c = CGPoint(x: obs.boundingBox.midX, y: obs.boundingBox.midY)
-                            self.ballTrailNormalized.append(c)
-                            if self.ballTrailNormalized.count > self.maxTrailLength { self.ballTrailNormalized.removeFirst() }
-                        }
+                    
+                    let baseballDetections = results.filter { obs in
+                        guard let label = obs.labels.first else { return false }
+                        return label.identifier == "baseball" && obs.confidence >= self.confidenceThreshold
+                    }.sorted { $0.confidence > $1.confidence }
+                    for obs in baseballDetections {
+                        let c = CGPoint(x: obs.boundingBox.midX, y: obs.boundingBox.midY)
+                        self.detectionMarkers.append(c)
                     }
 
                     let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
                     while !writerInput.isReadyForMoreMediaData { usleep(1000) }
-                    // Always compose annotation overlays on the pixel buffer before appending
                     if let annotated = self.makeAnnotatedPixelBuffer(from: px, observations: results, pool: adaptor.pixelBufferPool) {
                         _ = adaptor.append(annotated, withPresentationTime: pts)
                     } else {
@@ -793,17 +948,14 @@ class CameraViewController: UIViewController {
     }
 
     // MARK: - Save to Photos and Show Completion for Exported Video
-    // Note: This method is still used by file export flow.
-    // For live recording save flow, use saveToPhotosThenAlert(outputURL:)
+
     @MainActor
     private func saveAndShowExportCompletion(outputURL: URL) async {
-        // Save to Photos with permission handling, then notify and show alert
         await withCheckedContinuation { continuation in
             self.ensurePhotoLibraryPermission { granted in
                 
                 Task { @MainActor in
                     guard granted else {
-                        // User did NOT grant permissions: show alert and do NOT pass localIdentifier
                         self.onVideoSaved?("")
                         let alert = UIAlertController(title: "Photos Access Denied",
                                                       message: "Annotated video exported to a temporary file, but app does not have permission to save to Photos. Please enable Photos access in Settings.",
@@ -820,14 +972,12 @@ class CameraViewController: UIViewController {
                     var localIdentifier: String?
                     
                     PHPhotoLibrary.shared().performChanges({
-                        // Request creation and capture localIdentifier for later use
                         if let placeholder = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: outputURL)?.placeholderForCreatedAsset {
                             localIdentifier = placeholder.localIdentifier
                         }
                     }) { success, error in
                         Task { @MainActor in
                             if success, let id = localIdentifier {
-                                // Successfully saved video to Photos
                                 self.onVideoSaved?(id)
                                 let alert = UIAlertController(title: "Success",
                                                               message: "Annotated video saved to Photos.",
@@ -838,7 +988,6 @@ class CameraViewController: UIViewController {
                                 })
                                 self.topMostViewController().present(alert, animated: true)
                             } else {
-                                // Failed to save video to Photos: show error alert and notify with empty string
                                 self.onVideoSaved?("")
                                 let alert = UIAlertController(title: "Save Failed",
                                                               message: "Could not save video to Photos. Please check permissions or available space.",
@@ -874,29 +1023,32 @@ class CameraViewController: UIViewController {
             CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
         }
 
-        // Create CIImage from source buffer
         let srcImage = CIImage(cvPixelBuffer: pixelBuffer)
 
-        // Destination rect for drawing
         let rect = CGRect(x: 0, y: 0,
                           width: CVPixelBufferGetWidth(output),
                           height: CVPixelBufferGetHeight(output))
 
-        // Draw overlays using Core Graphics
         UIGraphicsBeginImageContextWithOptions(rect.size, false, 1.0)
         guard let ctx = UIGraphicsGetCurrentContext() else {
             UIGraphicsEndImageContext()
             return output
         }
 
-        // Draw the current frame without altering vertical orientation
         let uiImage = UIImage(ciImage: srcImage)
         uiImage.draw(in: rect)
 
-        // Draw bounding boxes for allowed classes
-        for obs in observations {
-            guard let id = obs.labels.first?.identifier,
-                  allowedClasses.contains(id) else { continue }
+        let baseballDetections = observations.filter { obs in
+            guard let label = obs.labels.first else { return false }
+            return label.identifier == "baseball" && obs.confidence >= self.confidenceThreshold
+        }.sorted { $0.confidence > $1.confidence }
+        
+        for obs in baseballDetections {
+            let c = CGPoint(x: obs.boundingBox.midX, y: obs.boundingBox.midY)
+            self.detectionMarkers.append(c)
+        }
+        
+        if let obs = baseballDetections.first {
             let bbox = obs.boundingBox
             var x = bbox.origin.x * rect.width
             var y = bbox.origin.y * rect.height
@@ -910,24 +1062,70 @@ class CameraViewController: UIViewController {
             let drawRect = CGRect(x: x, y: y, width: w, height: h)
 
             ctx.setStrokeColor(UIColor.red.cgColor)
-            ctx.setLineWidth(2)
-            ctx.stroke(drawRect)
+            ctx.setLineWidth(3)
+            ctx.addEllipse(in: drawRect)
+            ctx.strokePath()
+            
+            let centerX = drawRect.midX
+            let centerY = drawRect.midY
+            let confidenceText = String(format: "%.0f%%", obs.confidence * 100)
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: UIFont.boldSystemFont(ofSize: 28),
+                .foregroundColor: UIColor.red
+            ]
+            
+            ctx.saveGState()
+            ctx.translateBy(x: centerX, y: centerY)
+            ctx.rotate(by: -.pi / 2)
+            
+            let textSize = confidenceText.size(withAttributes: attributes)
+            confidenceText.draw(at: CGPoint(x: -textSize.width / 2, y: -textSize.height / 2),
+                               withAttributes: attributes)
+            
+            ctx.restoreGState()
+        } else {
         }
-
-        // Draw ball trail
-        if !ballTrailNormalized.isEmpty {
-            for (i, p) in ballTrailNormalized.enumerated() {
-                var x = p.x * rect.width
-                var y = p.y * rect.height
-                if !contentFlippedVertically {
-                    y = rect.height - y
-                }
-                
-                if mirrored { x = rect.width - x }
-                let radius: CGFloat = 5
-                let alpha = CGFloat(i) / CGFloat(maxTrailLength)
-                ctx.setFillColor(UIColor.red.withAlphaComponent(alpha).cgColor)
-                ctx.fillEllipse(in: CGRect(x: x - radius, y: y - radius, width: radius * 2, height: radius * 2))
+        
+        if self.detectionMarkers.count >= 3 {
+            let smoothedPoints = TrajectoryKalmanSmoother.smoothTrajectory(self.detectionMarkers)
+            
+            ctx.setStrokeColor(UIColor.red.withAlphaComponent(0.9).cgColor)
+            ctx.setLineWidth(25)
+            ctx.setLineCap(.round)
+            ctx.setLineJoin(.round)
+            
+            var sfx = smoothedPoints[0].x * rect.width
+            var sfy = smoothedPoints[0].y * rect.height
+            if !contentFlippedVertically { sfy = rect.height - sfy }
+            if mirrored { sfx = rect.width - sfx }
+            ctx.move(to: CGPoint(x: sfx, y: sfy))
+            
+            for i in 1..<smoothedPoints.count {
+                var sx = smoothedPoints[i].x * rect.width
+                var sy = smoothedPoints[i].y * rect.height
+                if !contentFlippedVertically { sy = rect.height - sy }
+                if mirrored { sx = rect.width - sx }
+                ctx.addLine(to: CGPoint(x: sx, y: sy))
+            }
+            ctx.strokePath()
+        }
+        
+        if !self.detectionMarkers.isEmpty {
+            for normCenter in self.detectionMarkers {
+                var cx = normCenter.x * rect.width
+                var cy = normCenter.y * rect.height
+                if !contentFlippedVertically { cy = rect.height - cy }
+                if mirrored { cx = rect.width - cx }
+                let markerSize: CGFloat = 12
+                let markerRect = CGRect(x: cx - markerSize/2,
+                                        y: cy - markerSize/2,
+                                        width: markerSize,
+                                        height: markerSize)
+                ctx.setFillColor(UIColor.red.cgColor)
+                ctx.fillEllipse(in: markerRect)
+                ctx.setStrokeColor(UIColor.white.withAlphaComponent(0.8).cgColor)
+                ctx.setLineWidth(2)
+                ctx.strokeEllipse(in: markerRect)
             }
         }
 
@@ -945,7 +1143,6 @@ class CameraViewController: UIViewController {
     // MARK: - Export Completion / Redirect
     private func showExportCompletion(url: URL) {
         DispatchQueue.main.async {
-            // Notify callback with file path (legacy behavior)
             self.onVideoSaved?(url.path)
 
             let alert = UIAlertController(title: "Success",
@@ -981,11 +1178,9 @@ class CameraViewController: UIViewController {
 
                 let t = try await track.load(.preferredTransform)
                 
-                let angle = atan2(Double(t.b), Double(t.a)) // radians
+                let angle = atan2(Double(t.b), Double(t.a))
                 var degrees = Int(round(angle * 180.0 / .pi))
-                // Normalize to [0, 360)
                 degrees = (degrees % 360 + 360) % 360
-                // Snap to nearest right angle (0, 90, 180, 270)
                 let snapped: Int = {
                     let options = [0, 90, 180, 270]
                     let diffs = options.map { abs($0 - degrees) }
@@ -995,20 +1190,17 @@ class CameraViewController: UIViewController {
                     return 0
                 }()
 
-                // If a < 0 when rotation is 0/180, or c and b signs imply flip when 90/270.
                 var mirrored = false
                 switch snapped {
                 case 0, 180:
                     mirrored = (t.a < 0)
                 case 90, 270:
-                    // For portrait-like rotations, horizontal flip manifests on the vertical axis component
                     mirrored = (t.d < 0)
                 default:
                     mirrored = false
                 }
                 self.mirrored = mirrored
 
-                // Upside down if rotation is 180
                 self.contentUpsideDown = (snapped == 180)
 
                 self.contentFlippedVertically = false
@@ -1047,45 +1239,81 @@ class CameraViewController: UIViewController {
 // MARK: - Live Capture Delegate
 extension CameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard videoURL == nil, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard videoURL == nil else { return }
 
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-        try? handler.perform(self.requests)
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         
         if isRecording {
             guard let assetWriter = assetWriter,
                   let assetWriterInput = assetWriterInput,
-                  let pixelBufferAdaptor = pixelBufferAdaptor else { return }
-            
-            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                  let pixelBufferAdaptor = pixelBufferAdaptor,
+                  let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
             
             if recordingStartTime == nil {
                 assetWriter.startWriting()
                 assetWriter.startSession(atSourceTime: pts)
                 recordingStartTime = pts
+                print("[Recording] Writer started. Status: \(assetWriter.status.rawValue)")
             }
             
-            guard assetWriterInput.isReadyForMoreMediaData else { return }
+            if assetWriter.status == .failed {
+                print("[Recording] ERROR: Writer failed with error: \(assetWriter.error?.localizedDescription ?? "unknown")")
+                return
+            }
             
-            // Always compose annotation overlays on the pixel buffer
-            // This ensures that the recorded video includes overlays such as bounding boxes and ball trails.
-            // The pixel buffer is not rotated here; it matches the orientation of the live preview.
-            let annotatedBuffer = makeAnnotatedPixelBuffer(from: pixelBuffer,
-                                                           observations: lastObservations,
-                                                           pool: pixelBufferAdaptor.pixelBufferPool)
+            frameCount += 1
+            if let lastTime = lastFrameTime {
+                let deltaTime = CMTimeGetSeconds(CMTimeSubtract(pts, lastTime))
+                let instantFPS = 1.0 / deltaTime
+                
+                if frameCount % 60 == 0 {
+                    let avgTime = CMTimeGetSeconds(CMTimeSubtract(pts, recordingStartTime ?? pts))
+                    let avgFPS = avgTime > 0 ? Double(frameCount) / avgTime : 0
+                    print("[Recording] Frame \(frameCount): instant=\(String(format: "%.1f", instantFPS)) fps, avg=\(String(format: "%.1f", avgFPS)) fps, ready=\(assetWriterInput.isReadyForMoreMediaData)")
+                }
+            }
+            lastFrameTime = pts
             
-            if let annotatedBuffer = annotatedBuffer {
-                pixelBufferAdaptor.append(annotatedBuffer, withPresentationTime: pts)
+            if assetWriterInput.isReadyForMoreMediaData {
+                let success = pixelBufferAdaptor.append(pixelBuffer, withPresentationTime: pts)
+                if !success {
+                    print("[Recording] WARNING: Failed to append frame \(frameCount)")
+                }
             } else {
-                pixelBufferAdaptor.append(pixelBuffer, withPresentationTime: pts)
+                print("[Recording] WARNING: Writer not ready, dropping frame \(frameCount)")
             }
+            
+            if frameCount % 4 == 0 {
+                visionQueue.async { [weak self, sampleBuffer] in
+                    guard let self = self,
+                          let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+                    
+                    let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+                    try? handler.perform(self.requests)
+                }
+            }
+            
+            return
+        }
+        
+        guard frameCount % 4 == 0 else {
+            frameCount += 1
+            return
+        }
+        frameCount += 1
+        
+        visionQueue.async { [weak self, sampleBuffer] in
+            guard let self = self,
+                  let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+            
+            let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+            try? handler.perform(self.requests)
         }
     }
 }
 
 // MARK: - UIViewController extension for safe alert presentation
 private extension UIViewController {
-    /// Returns the top-most presented view controller starting from this view controller.
     func topMostViewController() -> UIViewController {
         var top = self
         while let presented = top.presentedViewController {
@@ -1094,4 +1322,3 @@ private extension UIViewController {
         return top
     }
 }
-
