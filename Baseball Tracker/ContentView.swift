@@ -10,76 +10,83 @@ struct ContentView: View {
     @State private var lastVideoIdentifier: String?
     @State private var lastVideoThumbnail: UIImage?
     @State private var showingLastVideo = false
-    @State private var currentVideoURL: URL? // Video to send to CameraView
-    @State private var isRecordingLive = false // Track live recording
+    @State private var currentVideoURL: URL?
+    @State private var isRecordingLive = false
     @State private var pickedVideo: PickedVideo?
 
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                VStack(spacing: geo.size.height * 0.03) {
-                    
-                    
+                
+                Color.black.ignoresSafeArea()
+                
+                VStack(spacing: 0) {
                     if let identifier = lastVideoIdentifier, !identifier.isEmpty {
-                        HStack {
-                            Spacer()
-                            PhotosVideoPlayer(localIdentifier: identifier, showControls: false, loop: true)
-                                .frame(width: geo.size.width * 0.3,
-                                       height: geo.size.width * 0.3 * 9/16)
-                                .cornerRadius(12)
-                                .shadow(radius: 3)
-                                .onTapGesture { showingLastVideo = true }
-                        }
-                        .padding(.top, geo.safeAreaInsets.top + 10)
-                        .padding(.trailing, 16)
-                    } else if let thumbnail = lastVideoThumbnail {
-                        // fallback thumbnail image
-                        HStack {
-                            Spacer()
-                            Image(uiImage: thumbnail)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: geo.size.width * 0.3,
-                                       height: geo.size.width * 0.3 * 9/16)
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
-                                .overlay(RoundedRectangle(cornerRadius: 12)
-                                    .stroke(Color.white, lineWidth: 2))
-                                .shadow(radius: 3)
-                        }
-                        .padding(.top, geo.safeAreaInsets.top + 10)
-                        .padding(.trailing, 16)
-                    }
-
-                    Spacer(minLength: geo.size.height * 0.1)
-
-                    // Open live camera with overlay for detecting baseballs
-                    Button("Open Camera") {
-                        currentVideoURL = nil
-                        showingCamera = true
-                    }
-                    .font(.headline)
-                    .padding()
-                    .frame(maxWidth: .infinity)
-                    .background(Color.blue)
-                    .foregroundColor(.white)
-                    .cornerRadius(geo.size.height * 0.03)
-
-                    // Select from library
-                    PhotosPicker(selection: $selectedItem,
-                                 matching: .videos,
-                                 photoLibrary: .shared()) {
-                        Text("Select Video")
-                            .font(.headline)
-                            .padding()
+                        PhotosVideoPlayer(localIdentifier: identifier, showControls: false, loop: true)
                             .frame(maxWidth: .infinity)
-                            .background(Color.blue)
-                            .foregroundColor(.white)
-                            .cornerRadius(geo.size.height * 0.03)
+                            .frame(height: geo.size.height * 0.68)
+                            .cornerRadius(16)
+                            .shadow(radius: 8)
+                            .padding(.horizontal, 16)
+                            .padding(.top, geo.safeAreaInsets.top + 16)
+                            .onTapGesture { showingLastVideo = true }
+                    } else if let thumbnail = lastVideoThumbnail {
+                        Image(uiImage: thumbnail)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxWidth: .infinity)
+                            .frame(height: geo.size.height * 0.68)
+                            .clipShape(RoundedRectangle(cornerRadius: 16))
+                            .overlay(RoundedRectangle(cornerRadius: 16)
+                                .stroke(Color.white, lineWidth: 2))
+                            .shadow(radius: 8)
+                            .padding(.horizontal, 16)
+                            .padding(.top, geo.safeAreaInsets.top + 16)
+                    } else {
+                        VStack {
+                            Image(systemName: "video.slash")
+                                .font(.system(size: 80))
+                                .foregroundColor(.gray)
+                            Text("No video recorded yet")
+                                .font(.headline)
+                                .foregroundColor(.gray)
+                                .padding(.top, 8)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .frame(height: geo.size.height * 0.68)
+                        .padding(.horizontal, 16)
+                        .padding(.top, geo.safeAreaInsets.top + 16)
                     }
 
                     Spacer()
+
+                    VStack(spacing: 12) {
+                        Button("Open Camera") {
+                            currentVideoURL = nil
+                            showingCamera = true
+                        }
+                        .font(.headline)
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(Color.blue)
+                        .foregroundColor(.white)
+                        .cornerRadius(12)
+
+                        PhotosPicker(selection: $selectedItem,
+                                     matching: .videos,
+                                     photoLibrary: .shared()) {
+                            Text("Select Video")
+                                .font(.headline)
+                                .padding()
+                                .frame(maxWidth: .infinity)
+                                .background(Color.blue)
+                                .foregroundColor(.white)
+                                .cornerRadius(12)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, max(geo.safeAreaInsets.bottom + 24, 40))
                 }
-                .padding()
             }
         }
         .fullScreenCover(isPresented: $showingCamera) {
@@ -96,10 +103,16 @@ struct ContentView: View {
             )
             .ignoresSafeArea()
         }
-        .fullScreenCover(item: $pickedVideo) {
+        .fullScreenCover(item: $pickedVideo) { video in
             CameraView(
-                onVideoSaved: nil,
-                videoURL: $0.url,
+                onVideoSaved: { identifier in
+                    Task { @MainActor in
+                        lastVideoIdentifier = identifier
+                        pickedVideo = nil
+                        print("✅ Processed video saved. Returning to home with identifier: \(identifier)")
+                    }
+                },
+                videoURL: video.url,
                 isRecordingLive: .constant(false)
             )
             .ignoresSafeArea()
@@ -237,13 +250,13 @@ struct PhotosVideoPlayer: View {
     }
 
     private func fetchPlayerWithRetry() async {
-        for attempt in 1...6 { // retry up to ~3s total
+        for attempt in 1...6 {
             if await fetchPlayer() {
                 print("✅ Player loaded after \(attempt) attempt(s)")
                 return
             } else {
                 print("⏳ Retrying player fetch (\(attempt))...")
-                try? await Task.sleep(nanoseconds: 500_000_000) // 0.5s
+                try? await Task.sleep(nanoseconds: 500_000_000)
             }
         }
         print("⚠️ Failed to load player after retries")
@@ -258,7 +271,6 @@ struct PhotosVideoPlayer: View {
         options.deliveryMode = .highQualityFormat
         options.isNetworkAccessAllowed = true
 
-        // Bridge the callback API to async/await
         return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
             PHImageManager.default().requestPlayerItem(forVideo: asset, options: options) { playerItem, _ in
                 if let item = playerItem {
