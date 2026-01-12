@@ -2,9 +2,9 @@ import cv2
 import os
 
 # Paths
-dataset_folder = '/labelling/images.cv/data/'  # Root folder of dataset
+dataset_folder = '/labelling/images.cv/data/'  
 splits = ['train', 'val', 'test']
-class_id = 0  # Baseball class
+class_id = 0  
 
 # Globals
 drawing = False
@@ -33,7 +33,7 @@ def draw_box(event, x, y, flags, param):
         cv2.imshow('image', img)
 
 
-# Loop through splits
+
 for split in splits:
     img_folder = os.path.join(dataset_folder, split, 'baseball')
     labels_folder = os.path.join(dataset_folder, split, 'labels')
@@ -57,7 +57,7 @@ for split in splits:
             key = cv2.waitKey(1) & 0xFF
 
             if key == ord('s'):
-                # Preview step
+                
                 preview_img = img.copy()
                 for (x1, y1, x2, y2) in current_boxes:
                     cv2.rectangle(preview_img, (x1, y1), (x2, y2), (0, 0, 255), 2)
